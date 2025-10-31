@@ -1,0 +1,440 @@
+name: 'Pull Request Validation'
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+env:
+  TF_VERSION: '1.6.0'
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Job 1: Code Quality & Security
+  code-quality:
+    name: 'Code Quality & Security Analysis'
+    runs-on: ubuntu-latest
+    if: '!github.event.pull_request.draft'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Needed for SonarCloud
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint black isort mypy bandit safety
+          pip install requests pyyaml
+      
+      - name: Python Code Formatting Check
+        run: |
+          echo "🔍 Checking Python code formatting..."
+          black --check --diff scripts/
+          isort --check-only --diff scripts/
+      
+      - name: Python Linting
+        run: |
+          echo "🔍 Running Python linting..."
+          pylint scripts/**/*.py --output-format=text --reports=no --exit-zero
+      
+      - name: Security Analysis (Bandit)
+        run: |
+          echo "🔒 Running security analysis..."
+          bandit -r scripts/ -f json -o bandit-report.json || true
+          
+          if [ -f bandit-report.json ]; then
+            high_severity=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-report.json)
+            medium_severity=$(jq '[.results[] | select(.issue_severity == "MEDIUM")] | length' bandit-report.json)
+            
+            echo "🔒 Security Analysis Results:"
+            echo "  High severity issues: $high_severity"
+            echo "  Medium severity issues: $medium_severity"
+            
+            if [ "$high_severity" -gt 0 ]; then
+              echo "❌ High severity security issues found!"
+              exit 1
+            fi
+          fi
+      
+      - name: Dependency Security Check
+        run: |
+          echo "📦 Checking dependency security..."
+          safety check --json --output safety-report.json || true
+      
+      - name: Shell Script Linting
+        run: |
+          echo "🐚 Checking shell scripts..."
+          if command -v shellcheck &> /dev/null; then
+            find scripts -name "*.sh" -exec shellcheck {} \;
+          else
+            echo "shellcheck not available, skipping shell script analysis"
+          fi
+      
+      - name: Upload Security Reports
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+          retention-days: 30
+
+  # Job 2: Terraform Validation
+  terraform-validation:
+    name: 'Terraform Validation & Planning'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -recursive -diff
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -backend=false
+      
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
+      
+      - name: Terraform Plan (Development)
+        id: plan
+        run: |
+          cd terraform
+          
+          # Create a test variables file
+          cat > terraform.tfvars << EOF
+          environment = "dev"
+          web_container_count = 2
+          load_balancer_port = 8080
+          monitoring_enabled = true
+          enable_drift_detection = true
+          EOF
+          
+          terraform plan -detailed-exitcode -out=tfplan
+          terraform show -no-color tfplan > ../terraform-plan.txt
+        continue-on-error: true
+      
+      - name: Comment Terraform Plan
+        if: steps.plan.outcome == 'success'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform-plan.txt', 'utf8');
+            
+            const output = `### 📋 Terraform Plan Results
+            
+            \`\`\`hcl
+            ${plan.slice(0, 10000)}${plan.length > 10000 ? '\n... (truncated)' : ''}
+            \`\`\`
+            
+            <details><summary>💡 Plan Summary</summary>
+            
+            Exit Code: \`${{ steps.plan.outputs.exitcode }}\`
+            - Exit Code 0: No changes
+            - Exit Code 1: Error
+            - Exit Code 2: Changes detected
+            
+            </details>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+      
+      - name: Terraform Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'terraform/'
+          format: 'sarif'
+          output: 'trivy-terraform.sarif'
+      
+      - name: Upload Terraform Security Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-terraform.sarif'
+          category: 'terraform-security'
+
+  # Job 3: Integration Testing
+  integration-tests:
+    name: 'Integration Tests'
+    runs-on: ubuntu-latest
+    needs: [terraform-validation]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Install Test Dependencies
+        run: |
+          pip install pytest pytest-cov requests docker
+      
+      - name: Create Test Environment
+        run: |
+          mkdir -p config logs backups
+          
+          cat > config/drift-detection.json << EOF
+          {
+            "environment": "test",
+            "monitoring": {
+              "enabled": true,
+              "check_interval": 60,
+              "webhook_url": ""
+            },
+            "infrastructure": {
+              "containers": {
+                "web": {
+                  "count": 1,
+                  "image": "nginx:alpine",
+                  "port": 80
+                },
+                "database": {
+                  "image": "postgres:13-alpine",
+                  "port": 5432
+                }
+              },
+              "network": {
+                "name": "iac-drift-network-test",
+                "subnet": "172.20.0.0/16"
+              }
+            },
+            "backup": {
+              "enabled": false
+            }
+          }
+          EOF
+      
+      - name: Test Drift Detection Script
+        run: |
+          echo "🧪 Testing drift detection functionality..."
+          cd scripts/drift-detection
+          
+          # Test script syntax
+          python3 -m py_compile drift-detector.py
+          
+          # Test configuration loading
+          python3 -c "
+          import sys
+          sys.path.append('.')
+          from drift_detector import DriftDetector
+          detector = DriftDetector('../../config/drift-detection.json')
+          print('✅ Configuration loaded successfully')
+          print(f'Environment: {detector.config.get(\"environment\", \"unknown\")}')
+          "
+      
+      - name: Test Remediation Scripts
+        run: |
+          echo "🧪 Testing remediation functionality..."
+          cd scripts/remediation
+          
+          # Test script syntax
+          python3 -m py_compile auto-remediate.py
+          python3 -m py_compile rollback.py
+          
+          echo "✅ Remediation scripts compiled successfully"
+      
+      - name: Test Workflow Scripts
+        run: |
+          echo "🧪 Testing workflow scripts..."
+          
+          # Test shell scripts
+          bash -n scripts/drift-detection/get-current-state.sh
+          bash -n scripts/drift-detection/drift-monitor.sh
+          bash -n scripts/remediation/remediation-workflow.sh
+          
+          echo "✅ Shell scripts syntax validated"
+      
+      - name: Docker Integration Test
+        run: |
+          echo "🐳 Running Docker integration test..."
+          
+          # Test Docker network creation
+          docker network create test-network || true
+          
+          # Test basic container deployment
+          docker run -d --name test-nginx --network test-network nginx:alpine
+          
+          # Wait and check
+          sleep 10
+          
+          if docker ps | grep test-nginx; then
+            echo "✅ Docker integration test passed"
+          else
+            echo "❌ Docker integration test failed"
+            exit 1
+          fi
+          
+          # Cleanup
+          docker stop test-nginx || true
+          docker rm test-nginx || true
+          docker network rm test-network || true
+
+  # Job 4: Documentation Check
+  documentation:
+    name: 'Documentation Validation'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Check Documentation Files
+        run: |
+          echo "📚 Checking documentation completeness..."
+          
+          # Check if README exists and has minimum content
+          if [ ! -f README.md ]; then
+            echo "❌ README.md is missing"
+            exit 1
+          fi
+          
+          # Check README content
+          if grep -q "# IaC Drift Detection" README.md; then
+            echo "✅ README.md has proper title"
+          else
+            echo "⚠️ README.md might need better documentation"
+          fi
+          
+          # Check for configuration documentation
+          if [ -f docs/configuration.md ]; then
+            echo "✅ Configuration documentation found"
+          else
+            echo "⚠️ Configuration documentation could be improved"
+          fi
+          
+          # Check for inline documentation in scripts
+          python_files=$(find scripts -name "*.py")
+          for file in $python_files; do
+            if grep -q '"""' "$file"; then
+              echo "✅ $file has docstrings"
+            else
+              echo "⚠️ $file could use better documentation"
+            fi
+          done
+
+  # Job 5: Performance & Resource Analysis
+  performance:
+    name: 'Performance Analysis'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Analyze Script Performance
+        run: |
+          echo "⚡ Analyzing script performance..."
+          
+          # Check script complexity and size
+          find scripts -name "*.py" -exec wc -l {} \; | while read lines file; do
+            if [ "$lines" -gt 1000 ]; then
+              echo "⚠️ Large file: $file ($lines lines)"
+            fi
+          done
+          
+          find scripts -name "*.sh" -exec wc -l {} \; | while read lines file; do
+            if [ "$lines" -gt 500 ]; then
+              echo "⚠️ Large script: $file ($lines lines)"
+            fi
+          done
+      
+      - name: Resource Usage Estimation
+        run: |
+          echo "📊 Estimating resource usage..."
+          
+          # Estimate Docker resource usage
+          echo "Expected Docker containers:"
+          echo "- Web containers: 2 (dev) / 4 (prod)"
+          echo "- Database: 1"
+          echo "- Load balancer: 1" 
+          echo "- Monitoring: 3 (Prometheus, Grafana, cAdvisor)"
+          echo ""
+          echo "Estimated total: 7-9 containers"
+          echo "Estimated memory: 2-4 GB"
+          echo "Estimated CPU: 2-4 cores"
+
+  # Job 6: Final PR Status Check
+  pr-status:
+    name: 'PR Status Summary'
+    runs-on: ubuntu-latest
+    needs: [code-quality, terraform-validation, integration-tests, documentation, performance]
+    if: always()
+    
+    steps:
+      - name: PR Status Summary
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const jobs = {
+              'code-quality': '${{ needs.code-quality.result }}',
+              'terraform-validation': '${{ needs.terraform-validation.result }}',
+              'integration-tests': '${{ needs.integration-tests.result }}',
+              'documentation': '${{ needs.documentation.result }}',
+              'performance': '${{ needs.performance.result }}'
+            };
+            
+            let summary = "## 🔍 Pull Request Validation Summary\n\n";
+            let allPassed = true;
+            
+            for (const [job, result] of Object.entries(jobs)) {
+              const icon = result === 'success' ? '✅' : result === 'failure' ? '❌' : '⏭️';
+              summary += `${icon} **${job.replace('-', ' ').toUpperCase()}**: ${result}\n`;
+              
+              if (result === 'failure') {
+                allPassed = false;
+              }
+            }
+            
+            summary += `\n**Overall Status**: ${allPassed ? '✅ PASSED' : '❌ FAILED'}\n`;
+            
+            if (allPassed) {
+              summary += "\n🎉 All checks passed! This PR is ready for review.\n";
+            } else {
+              summary += "\n⚠️ Some checks failed. Please review and fix the issues before merging.\n";
+            }
+            
+            summary += "\n---\n*Automated validation by IaC Drift Detection CI/CD*";
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+            
+            // Set step summary
+            core.summary.addRaw(summary);
+            await core.summary.write();

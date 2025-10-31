@@ -1,0 +1,190 @@
+{
+  "environment": "dev",
+  "project_name": "IaC Drift Detection",
+  "terraform": {
+    "config_dir": "../../terraform",
+    "state_backend": "local",
+    "plan_timeout": 300,
+    "auto_approve_threshold": 0.8
+  },
+  "docker": {
+    "compose_file": "../terraform/docker-compose.yml",
+    "network_name": "iac-drift-network",
+    "labels": {
+      "project": "iac-drift-detection",
+      "managed_by": "terraform"
+    }
+  },
+  "drift_detection": {
+    "schedule": "0 */2 * * *",
+    "check_interval": 300,
+    "sensitivity": "medium",
+    "ignore_patterns": [
+      "*.log",
+      "tmp/*",
+      ".terraform/*"
+    ],
+    "critical_resources": [
+      "docker_container.web",
+      "docker_container.database", 
+      "docker_network.main"
+    ]
+  },
+  "remediation": {
+    "auto_remediate": true,
+    "approval_required": true,
+    "max_retry_attempts": 3,
+    "rollback_enabled": true,
+    "safety_checks": [
+      "backup_before_change",
+      "validate_plan",
+      "check_dependencies"
+    ]
+  },
+  "monitoring": {
+    "health_check_interval": 60,
+    "metrics_retention_days": 30,
+    "alert_thresholds": {
+      "cpu_warning": 70,
+      "cpu_critical": 85,
+      "memory_warning": 75,
+      "memory_critical": 90,
+      "disk_warning": 80,
+      "disk_critical": 95,
+      "container_health_threshold": 0.8
+    },
+    "prometheus": {
+      "enabled": true,
+      "port": 9090,
+      "scrape_interval": "15s"
+    },
+    "grafana": {
+      "enabled": true,
+      "port": 3000,
+      "admin_user": "admin",
+      "admin_password": "admin123"
+    }
+  },
+  "notifications": {
+    "enabled": true,
+    "channels": {
+      "slack": {
+        "enabled": false,
+        "webhook_url": "",
+        "channel": "#infrastructure-alerts",
+        "username": "IaC Drift Bot"
+      },
+      "email": {
+        "enabled": true,
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_username": "",
+        "smtp_password": "",
+        "sender_email": "",
+        "recipient_emails": ["admin@company.com"]
+      },
+      "teams": {
+        "enabled": false,
+        "webhook_url": ""
+      },
+      "discord": {
+        "enabled": false,
+        "webhook_url": ""
+      }
+    },
+    "notification_rules": {
+      "drift_detected": {
+        "priority": "high",
+        "channels": ["email", "slack"],
+        "cooldown_minutes": 30
+      },
+      "remediation_started": {
+        "priority": "medium",
+        "channels": ["slack"],
+        "cooldown_minutes": 60
+      },
+      "remediation_completed": {
+        "priority": "low",
+        "channels": ["slack"],
+        "cooldown_minutes": 0
+      },
+      "system_health": {
+        "priority": "critical",
+        "channels": ["email", "slack", "teams"],
+        "cooldown_minutes": 15
+      },
+      "backup_completed": {
+        "priority": "low",
+        "channels": ["email"],
+        "cooldown_minutes": 0
+      }
+    }
+  },
+  "backup": {
+    "enabled": true,
+    "schedule": "0 2 * * *",
+    "retention_days": 7,
+    "backup_paths": [
+      "../terraform",
+      "../scripts",
+      "../config",
+      "../logs"
+    ],
+    "compression": true,
+    "encryption_enabled": false
+  },
+  "security": {
+    "scan_enabled": true,
+    "vulnerability_scanning": {
+      "enabled": true,
+      "tools": ["trivy", "snyk"],
+      "schedule": "0 6 * * *"
+    },
+    "compliance_checks": {
+      "enabled": true,
+      "frameworks": ["CIS", "SOC2"],
+      "schedule": "0 4 * * 0"
+    },
+    "secret_management": {
+      "provider": "file",
+      "secrets_file": "../secrets/.env",
+      "rotation_enabled": false
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "log_dir": "../logs",
+    "max_file_size": "10MB",
+    "backup_count": 5,
+    "structured_logging": true,
+    "log_aggregation": {
+      "enabled": false,
+      "endpoint": "",
+      "api_key": ""
+    }
+  },
+  "api": {
+    "enabled": false,
+    "port": 8080,
+    "auth_required": true,
+    "api_key": "",
+    "rate_limiting": {
+      "enabled": true,
+      "requests_per_minute": 60
+    }
+  },
+  "deployment": {
+    "strategy": "rolling",
+    "health_check_timeout": 30,
+    "pre_deployment_checks": [
+      "terraform_validate",
+      "docker_health_check",
+      "dependency_check"
+    ],
+    "post_deployment_checks": [
+      "service_availability",
+      "health_endpoints",
+      "integration_tests"
+    ]
+  }
+}

@@ -1,0 +1,405 @@
+name: 'Infrastructure Deployment'
+
+on:
+  # Manual deployment trigger
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      terraform_action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: 'apply'
+      auto_approve:
+        description: 'Auto-approve Terraform apply'
+        required: false
+        type: boolean
+        default: false
+
+  # Deployment on release
+  release:
+    types: [published]
+
+env:
+  TF_VERSION: '1.6.0'
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Pre-deployment checks
+  pre-deploy-checks:
+    name: 'Pre-Deployment Security & Validation'
+    runs-on: ubuntu-latest
+    outputs:
+      security_passed: ${{ steps.security.outputs.passed }}
+      validation_passed: ${{ steps.validation.outputs.passed }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Security Scan
+        id: security
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'terraform/'
+          format: 'json'
+          output: 'security-results.json'
+        continue-on-error: true
+      
+      - name: Process Security Results
+        run: |
+          if [ -f "security-results.json" ]; then
+            critical_count=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "CRITICAL")] | length' security-results.json)
+            high_count=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "HIGH")] | length' security-results.json)
+            
+            if [ "$critical_count" -gt 0 ] || [ "$high_count" -gt 5 ]; then
+              echo "Security scan failed: $critical_count critical, $high_count high severity issues"
+              echo "passed=false" >> $GITHUB_OUTPUT
+            else
+              echo "Security scan passed: $critical_count critical, $high_count high severity issues"
+              echo "passed=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "passed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Terraform Validation
+        id: validation
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+          echo "passed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+      
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report
+          path: security-results.json
+          retention-days: 30
+
+  # Infrastructure deployment
+  deploy:
+    name: 'Deploy Infrastructure'
+    runs-on: ubuntu-latest
+    needs: pre-deploy-checks
+    if: needs.pre-deploy-checks.outputs.security_passed == 'true' && needs.pre-deploy-checks.outputs.validation_passed == 'true'
+    environment: 
+      name: ${{ github.event.inputs.environment || 'dev' }}
+      url: http://localhost:8080
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Create Infrastructure Configuration
+        run: |
+          mkdir -p config logs backups
+          
+          environment="${{ github.event.inputs.environment || 'dev' }}"
+          
+          cat > config/drift-detection.json << EOF
+          {
+            "environment": "$environment",
+            "monitoring": {
+              "enabled": true,
+              "check_interval": 300,
+              "webhook_url": "${{ secrets.SLACK_WEBHOOK_URL }}"
+            },
+            "infrastructure": {
+              "containers": {
+                "web": {
+                  "count": $([ "$environment" = "prod" ] && echo "4" || echo "2"),
+                  "image": "nginx:alpine",
+                  "port": 80
+                },
+                "database": {
+                  "image": "postgres:13-alpine",
+                  "port": 5432
+                }
+              },
+              "network": {
+                "name": "iac-drift-network-$environment",
+                "subnet": "172.20.0.0/16"
+              }
+            },
+            "backup": {
+              "enabled": true
+            }
+          }
+          EOF
+      
+      - name: Create Terraform Variables
+        run: |
+          environment="${{ github.event.inputs.environment || 'dev' }}"
+          
+          cat > terraform/terraform.tfvars << EOF
+          environment = "$environment"
+          web_container_count = $([ "$environment" = "prod" ] && echo "4" || echo "2")
+          load_balancer_port = $([ "$environment" = "prod" ] && echo "80" || echo "8080")
+          monitoring_enabled = true
+          enable_drift_detection = true
+          notification_webhook_url = "${{ secrets.SLACK_WEBHOOK_URL }}"
+          EOF
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          
+          case "${{ github.event.inputs.terraform_action || 'apply' }}" in
+            "destroy")
+              terraform plan -destroy -out=tfplan
+              ;;
+            *)
+              terraform plan -out=tfplan
+              ;;
+          esac
+          
+          terraform show -no-color tfplan > ../terraform-plan.txt
+      
+      - name: Upload Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-${{ github.event.inputs.environment || 'dev' }}
+          path: |
+            terraform-plan.txt
+            terraform/tfplan
+          retention-days: 7
+      
+      - name: Manual Approval Check
+        if: github.event.inputs.auto_approve != 'true' && github.event.inputs.terraform_action != 'plan'
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ vars.INFRASTRUCTURE_APPROVERS || github.actor }}
+          minimum-approvals: 1
+          issue-title: "Infrastructure Deployment Approval Required"
+          issue-body: |
+            ## 🚀 Infrastructure Deployment Approval
+            
+            **Environment**: `${{ github.event.inputs.environment || 'dev' }}`
+            **Action**: `${{ github.event.inputs.terraform_action || 'apply' }}`
+            **Triggered by**: @${{ github.actor }}
+            
+            ### Terraform Plan
+            ```
+            See the attached terraform-plan.txt artifact for detailed changes.
+            ```
+            
+            ### Security Scan Results
+            - Security scan: ✅ Passed
+            - Validation: ✅ Passed
+            
+            **Please review the changes and approve this deployment.**
+      
+      - name: Terraform Apply/Destroy
+        if: github.event.inputs.terraform_action != 'plan'
+        run: |
+          cd terraform
+          terraform apply tfplan
+      
+      - name: Post-Deployment Verification
+        if: github.event.inputs.terraform_action == 'apply'
+        run: |
+          # Wait for services to initialize
+          sleep 30
+          
+          # Run drift detection to verify deployment
+          cd scripts/drift-detection
+          python3 drift-detector.py --config ../../config/drift-detection.json
+          
+          # Check if services are healthy
+          environment="${{ github.event.inputs.environment || 'dev' }}"
+          
+          echo "🔍 Checking deployment health..."
+          
+          # Check if containers are running
+          container_count=$(docker ps --filter "label=environment=$environment" --format "table {{.Names}}" | wc -l)
+          echo "✅ Containers running: $((container_count - 1))"
+          
+          # Check load balancer health
+          port=$([ "$environment" = "prod" ] && echo "80" || echo "8080")
+          if curl -f "http://localhost:$port/health" > /dev/null 2>&1; then
+            echo "✅ Load balancer is healthy"
+          else
+            echo "❌ Load balancer health check failed"
+            exit 1
+          fi
+      
+      - name: Setup Monitoring
+        if: github.event.inputs.terraform_action == 'apply'
+        run: |
+          environment="${{ github.event.inputs.environment || 'dev' }}"
+          
+          # Start drift detection monitoring
+          cd scripts/drift-detection
+          ./drift-monitor.sh start
+          
+          echo "✅ Drift detection monitoring started"
+      
+      - name: Generate Deployment Report
+        if: always()
+        run: |
+          environment="${{ github.event.inputs.environment || 'dev' }}"
+          
+          cat > deployment-report.md << EOF
+          # 🚀 Infrastructure Deployment Report
+          
+          **Environment**: \`$environment\`
+          **Action**: \`${{ github.event.inputs.terraform_action || 'apply' }}\`
+          **Triggered by**: @${{ github.actor }}
+          **Workflow Run**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Timestamp**: \`$(date -u +"%Y-%m-%d %H:%M:%S UTC")\`
+          
+          ## 📊 Status
+          - Pre-deployment Security: ${{ needs.pre-deploy-checks.outputs.security_passed == 'true' && '✅ Passed' || '❌ Failed' }}
+          - Pre-deployment Validation: ${{ needs.pre-deploy-checks.outputs.validation_passed == 'true' && '✅ Passed' || '❌ Failed' }}
+          - Terraform Execution: ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }}
+          
+          ## 🔧 Infrastructure State
+          \`\`\`
+          $(terraform -chdir=terraform output -json 2>/dev/null | jq -r 'to_entries[] | "\(.key): \(.value.value)"' || echo "Output not available")
+          \`\`\`
+          
+          ## 📝 Next Steps
+          ${{ github.event.inputs.terraform_action == 'apply' && '
+          1. Monitor the infrastructure health
+          2. Verify drift detection is working
+          3. Check application accessibility' || '
+          1. Review the changes in the plan
+          2. Apply changes if approved' }}
+          EOF
+          
+          echo "## 📋 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          cat deployment-report.md >> $GITHUB_STEP_SUMMARY
+      
+      - name: Upload Deployment Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-report-${{ github.event.inputs.environment || 'dev' }}
+          path: deployment-report.md
+          retention-days: 30
+
+  # Post-deployment monitoring
+  post-deploy-monitoring:
+    name: 'Post-Deployment Monitoring'
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: needs.deploy.result == 'success' && github.event.inputs.terraform_action == 'apply'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Monitoring Dependencies
+        run: |
+          pip install requests
+      
+      - name: Wait and Monitor
+        run: |
+          environment="${{ github.event.inputs.environment || 'dev' }}"
+          
+          echo "🔍 Starting 5-minute post-deployment monitoring..."
+          
+          for i in {1..5}; do
+            echo "📊 Monitoring check $i/5..."
+            
+            # Check drift status
+            if cd scripts/drift-detection && python3 drift-detector.py --config ../../config/drift-detection.json; then
+              echo "✅ No drift detected (check $i)"
+            else
+              echo "⚠️ Drift detected in check $i"
+            fi
+            
+            # Check service health
+            port=$([ "$environment" = "prod" ] && echo "80" || echo "8080")
+            if curl -f "http://localhost:$port/health" > /dev/null 2>&1; then
+              echo "✅ Service healthy (check $i)"
+            else
+              echo "❌ Service health issue (check $i)"
+            fi
+            
+            sleep 60  # Wait 1 minute between checks
+          done
+          
+          echo "✅ Post-deployment monitoring completed"
+
+  # Notification
+  notify:
+    name: 'Send Deployment Notification'
+    runs-on: ubuntu-latest
+    needs: [deploy, post-deploy-monitoring]
+    if: always()
+    
+    steps:
+      - name: Send Success Notification
+        if: needs.deploy.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          text: |
+            🚀 Infrastructure Deployment Successful!
+            
+            Environment: `${{ github.event.inputs.environment || 'dev' }}`
+            Action: `${{ github.event.inputs.terraform_action || 'apply' }}`
+            Triggered by: ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Send Failure Notification
+        if: needs.deploy.result == 'failure'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          text: |
+            ❌ Infrastructure Deployment Failed!
+            
+            Environment: `${{ github.event.inputs.environment || 'dev' }}`
+            Action: `${{ github.event.inputs.terraform_action || 'apply' }}`
+            Please check the workflow logs for details.
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

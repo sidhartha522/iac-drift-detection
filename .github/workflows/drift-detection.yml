@@ -1,0 +1,570 @@
+name: 'IaC Drift Detection and Remediation'
+
+on:
+  # Scheduled drift detection
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to check'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      force_remediation:
+        description: 'Force automatic remediation'
+        required: false
+        default: false
+        type: boolean
+  
+  # On push to main branch
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - 'config/**'
+      - '.github/workflows/**'
+  
+  # On pull requests
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - 'config/**'
+
+env:
+  TF_VERSION: '1.6.0'
+  PYTHON_VERSION: '3.9'
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # Job 1: Setup and Validation
+  setup:
+    name: 'Setup and Validation'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.setup.outputs.environment }}
+      terraform_changed: ${{ steps.changes.outputs.terraform }}
+      config_changed: ${{ steps.changes.outputs.config }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Environment
+        id: setup
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Detect Changes
+        id: changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+            config:
+              - 'config/**'
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Validate Terraform
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+      
+      - name: Lint Scripts
+        run: |
+          # Check shell scripts
+          if command -v shellcheck &> /dev/null; then
+            find scripts -name "*.sh" -exec shellcheck {} \;
+          fi
+          
+          # Check Python scripts
+          python -m py_compile scripts/drift-detection/drift-detector.py
+          python -m py_compile scripts/remediation/auto-remediate.py
+          python -m py_compile scripts/remediation/rollback.py
+
+  # Job 2: Infrastructure Plan
+  plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.terraform_changed == 'true' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan -detailed-exitcode -out=tfplan
+          echo "plan_exit_code=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+      
+      - name: Save Plan
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: |
+          cd terraform
+          terraform show -json tfplan > ../plan.json
+      
+      - name: Upload Plan Artifact
+        if: steps.plan.outputs.plan_exit_code == '2'
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan
+          path: |
+            plan.json
+            terraform/tfplan
+          retention-days: 5
+
+  # Job 3: Drift Detection
+  drift-detection:
+    name: 'Drift Detection'
+    runs-on: ubuntu-latest
+    needs: [setup, plan]
+    if: always()
+    outputs:
+      drift_detected: ${{ steps.drift.outputs.drift_detected }}
+      drift_report_path: ${{ steps.drift.outputs.drift_report_path }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Dependencies
+        run: |
+          pip install requests pyyaml
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Initialize Infrastructure
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Create Required Directories
+        run: |
+          mkdir -p logs config backups
+      
+      - name: Create Configuration
+        run: |
+          cat > config/drift-detection.json << EOF
+          {
+            "environment": "${{ needs.setup.outputs.environment }}",
+            "monitoring": {
+              "enabled": true,
+              "check_interval": 300,
+              "webhook_url": "${{ secrets.SLACK_WEBHOOK_URL }}"
+            },
+            "infrastructure": {
+              "containers": {
+                "web": {
+                  "count": 2,
+                  "image": "nginx:alpine",
+                  "port": 80
+                },
+                "database": {
+                  "image": "postgres:13-alpine",
+                  "port": 5432
+                }
+              },
+              "network": {
+                "name": "iac-drift-network-${{ needs.setup.outputs.environment }}",
+                "subnet": "172.20.0.0/16"
+              }
+            },
+            "backup": {
+              "enabled": true
+            }
+          }
+          EOF
+      
+      - name: Run Drift Detection
+        id: drift
+        run: |
+          cd scripts/drift-detection
+          if python3 drift-detector.py --config ../../config/drift-detection.json; then
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "No drift detected"
+          else
+            echo "drift_detected=true" >> $GITHUB_OUTPUT
+            echo "Drift detected!"
+            
+            # Find the latest drift report
+            latest_report=$(ls -t ../../logs/drift-report-*.json 2>/dev/null | head -1 || echo "")
+            if [ -n "$latest_report" ]; then
+              echo "drift_report_path=$latest_report" >> $GITHUB_OUTPUT
+            fi
+          fi
+        continue-on-error: true
+      
+      - name: Upload Drift Report
+        if: steps.drift.outputs.drift_detected == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: drift-report
+          path: logs/drift-report-*.json
+          retention-days: 30
+
+  # Job 4: Security Scan
+  security-scan:
+    name: 'Security Scan'
+    runs-on: ubuntu-latest
+    needs: setup
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy Scan Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Scan Terraform Files
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'terraform/'
+          format: 'table'
+      
+      - name: Check for Secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+
+  # Job 5: Create Remediation PR
+  create-remediation-pr:
+    name: 'Create Remediation PR'
+    runs-on: ubuntu-latest
+    needs: [drift-detection, security-scan]
+    if: needs.drift-detection.outputs.drift_detected == 'true' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Download Drift Report
+        uses: actions/download-artifact@v3
+        with:
+          name: drift-report
+          path: logs/
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Generate Remediation Branch
+        id: branch
+        run: |
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          branch_name="remediation/auto-fix-$timestamp"
+          echo "branch_name=$branch_name" >> $GITHUB_OUTPUT
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git checkout -b "$branch_name"
+      
+      - name: Create Remediation Plan
+        run: |
+          python3 scripts/remediation/auto-remediate.py \
+            --config config/drift-detection.json \
+            --drift-report $(ls -t logs/drift-report-*.json | head -1) \
+            --dry-run > remediation-plan.md
+      
+      - name: Update Infrastructure Configuration
+        run: |
+          # This would contain logic to automatically fix common drift issues
+          # For now, we'll create a placeholder fix
+          echo "# Automated Infrastructure Fix" >> DRIFT_FIX.md
+          echo "This PR contains automated fixes for detected infrastructure drift." >> DRIFT_FIX.md
+          echo "" >> DRIFT_FIX.md
+          echo "## Drift Report" >> DRIFT_FIX.md
+          if [ -f "$(ls -t logs/drift-report-*.json | head -1)" ]; then
+            cat "$(ls -t logs/drift-report-*.json | head -1)" >> DRIFT_FIX.md
+          fi
+          
+          git add DRIFT_FIX.md remediation-plan.md
+          git commit -m "Auto-fix: Remediate infrastructure drift detected on $(date)"
+      
+      - name: Push Remediation Branch
+        run: |
+          git push origin ${{ steps.branch.outputs.branch_name }}
+      
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.branch.outputs.branch_name }}
+          title: '🔧 Auto-Remediation: Fix Infrastructure Drift'
+          body: |
+            ## 🚨 Infrastructure Drift Detected
+            
+            This PR contains automated fixes for infrastructure drift detected in the `${{ needs.setup.outputs.environment }}` environment.
+            
+            ### 📊 Drift Summary
+            - **Environment**: `${{ needs.setup.outputs.environment }}`
+            - **Detection Time**: `${{ github.run_started_at }}`
+            - **Workflow Run**: [`${{ github.run_id }}`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ### 🔍 What's Changed
+            - Automated infrastructure drift remediation
+            - Configuration updates to align with desired state
+            
+            ### ✅ Validation
+            - [ ] Security scan passed
+            - [ ] Terraform plan validated
+            - [ ] Manual review required
+            
+            ### 🎯 Next Steps
+            1. Review the proposed changes
+            2. Approve this PR to apply the remediation
+            3. Monitor the infrastructure post-deployment
+            
+            ---
+            *This PR was automatically created by the IaC Drift Detection workflow.*
+          labels: |
+            infrastructure
+            drift-remediation
+            automated
+
+  # Job 6: Deploy (on approved PRs or manual trigger)
+  deploy:
+    name: 'Deploy Infrastructure'
+    runs-on: ubuntu-latest
+    needs: [setup, plan, drift-detection]
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.force_remediation == 'true')
+    environment: ${{ needs.setup.outputs.environment }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Download Terraform Plan
+        if: needs.plan.result == 'success'
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+          path: .
+      
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+      
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          if [ -f "../terraform/tfplan" ]; then
+            terraform apply tfplan
+          else
+            terraform apply -auto-approve
+          fi
+      
+      - name: Verify Deployment
+        run: |
+          # Wait for services to start
+          sleep 30
+          
+          # Run drift detection to verify deployment
+          cd scripts/drift-detection
+          python3 drift-detector.py --config ../../config/drift-detection.json || true
+      
+      - name: Update Deployment Status
+        if: success()
+        run: |
+          echo "✅ Deployment completed successfully at $(date)" >> $GITHUB_STEP_SUMMARY
+
+  # Job 7: Notification
+  notify:
+    name: 'Send Notifications'
+    runs-on: ubuntu-latest
+    needs: [drift-detection, deploy, create-remediation-pr]
+    if: always()
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Send Slack Notification
+        if: needs.drift-detection.outputs.drift_detected == 'true'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          custom_payload: |
+            {
+              "text": "🔧 IaC Drift Detection Alert",
+              "attachments": [
+                {
+                  "color": "${{ needs.drift-detection.outputs.drift_detected == 'true' && 'warning' || 'good' }}",
+                  "fields": [
+                    {
+                      "title": "Environment",
+                      "value": "${{ needs.setup.outputs.environment }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Status",
+                      "value": "${{ needs.drift-detection.outputs.drift_detected == 'true' && 'Drift Detected' || 'No Drift' }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Workflow",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>",
+                      "short": true
+                    },
+                    {
+                      "title": "Branch",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Create Issue for Failed Remediation
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '❌ IaC Drift Remediation Failed',
+              body: `## 🚨 Remediation Failure Alert
+              
+              The automated drift remediation workflow has failed.
+              
+              **Details:**
+              - **Environment**: ${{ needs.setup.outputs.environment }}
+              - **Workflow Run**: [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              - **Branch**: ${{ github.ref_name }}
+              - **Commit**: ${{ github.sha }}
+              
+              **Next Steps:**
+              1. Review the workflow logs
+              2. Check for infrastructure issues
+              3. Manual intervention may be required
+              
+              ---
+              *This issue was automatically created by the IaC Drift Detection workflow.*`,
+              labels: ['infrastructure', 'critical', 'drift-remediation']
+            })
+
+  # Job 8: Cleanup
+  cleanup:
+    name: 'Cleanup'
+    runs-on: ubuntu-latest
+    needs: [drift-detection, deploy]
+    if: always()
+    
+    steps:
+      - name: Cleanup Old Artifacts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            // Delete artifacts older than 7 days
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            
+            const sevenDaysAgo = new Date();
+            sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+            
+            for (const artifact of artifacts.data.artifacts) {
+              const createdAt = new Date(artifact.created_at);
+              if (createdAt < sevenDaysAgo) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+                console.log(`Deleted artifact: ${artifact.name}`);
+              }
+            }

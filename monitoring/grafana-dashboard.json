@@ -1,0 +1,232 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "IaC Drift Detection Dashboard",
+    "tags": ["infrastructure", "drift-detection", "monitoring"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Infrastructure Health Score",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "infrastructure_health_score",
+            "legendFormat": "Health Score"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": 0},
+                {"color": "yellow", "value": 60},
+                {"color": "green", "value": 80}
+              ]
+            },
+            "unit": "percent"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Drift Detection Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "drift_detected",
+            "legendFormat": "Drift Status"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": 0},
+                {"color": "red", "value": 1}
+              ]
+            },
+            "mappings": [
+              {"options": {"0": {"text": "No Drift"}}, "type": "value"},
+              {"options": {"1": {"text": "Drift Detected"}}, "type": "value"}
+            ]
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "System Resource Usage",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "cpu_usage_percent",
+            "legendFormat": "CPU %"
+          },
+          {
+            "expr": "memory_usage_percent", 
+            "legendFormat": "Memory %"
+          },
+          {
+            "expr": "disk_usage_percent",
+            "legendFormat": "Disk %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            },
+            "unit": "percent",
+            "min": 0,
+            "max": 100
+          }
+        },
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "Container Health Status",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "healthy_containers",
+            "legendFormat": "Healthy"
+          },
+          {
+            "expr": "unhealthy_containers",
+            "legendFormat": "Unhealthy"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+      },
+      {
+        "id": 5,
+        "title": "Drift Detection Timeline",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "drift_detection_runs_total",
+            "legendFormat": "Detection Runs"
+          },
+          {
+            "expr": "drift_detected_total",
+            "legendFormat": "Drift Events"
+          },
+          {
+            "expr": "remediation_runs_total", 
+            "legendFormat": "Remediations"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            },
+            "unit": "short"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      },
+      {
+        "id": 6,
+        "title": "Recent Alerts",
+        "type": "logs",
+        "targets": [
+          {
+            "expr": "{job=\"drift-detection\"} |= \"ALERT\"",
+            "legendFormat": ""
+          }
+        ],
+        "gridPos": {"h": 6, "w": 24, "x": 0, "y": 24}
+      },
+      {
+        "id": 7,
+        "title": "Infrastructure Components",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "infrastructure_components",
+            "legendFormat": ""
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "displayMode": "table"
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30}
+      },
+      {
+        "id": 8,
+        "title": "Network Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "network_connectivity",
+            "legendFormat": "Network"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": 0},
+                {"color": "green", "value": 1}
+              ]
+            },
+            "mappings": [
+              {"options": {"0": {"text": "Disconnected"}}, "type": "value"},
+              {"options": {"1": {"text": "Connected"}}, "type": "value"}
+            ]
+          }
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 30}
+      },
+      {
+        "id": 9,
+        "title": "Last Backup",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "last_backup_timestamp",
+            "legendFormat": "Last Backup"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "dateTimeAsIso"
+          }
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 30}
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "30s",
+    "schemaVersion": 27,
+    "version": 1,
+    "uid": "iac-drift-dashboard"
+  }
+}

@@ -1,0 +1,42 @@
+# Python Requirements for IaC Drift Detection System
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+docker==6.1.3              # Docker API client
+psutil==5.9.5               # System and process utilities
+requests==2.31.0            # HTTP library
+
+# Monitoring and metrics
+prometheus-client==0.17.1   # Prometheus metrics client
+grafana-api==1.0.3          # Grafana API client
+
+# Notification services
+slack-sdk==3.21.3           # Slack API client
+pymsteams==0.2.2            # Microsoft Teams webhook client
+
+# Data processing
+pyyaml==6.0.1               # YAML parser
+jinja2==3.1.2               # Template engine
+
+# Logging and configuration
+python-dotenv==1.0.0        # Environment variable loading
+colorlog==6.7.0             # Colored logging
+click==8.1.6                # Command line interface
+
+# Security and encryption
+cryptography==41.0.3        # Cryptographic recipes
+python-jose==3.3.0          # JOSE implementation
+
+# Testing (optional)
+pytest==7.4.0              # Testing framework
+pytest-mock==3.11.1        # Mocking for pytest
+requests-mock==1.11.0      # HTTP request mocking
+
+# Development tools (optional)
+black==23.7.0               # Code formatter
+flake8==6.0.0               # Linting
+mypy==1.5.1                 # Type checking
+
+# Optional: Database support for advanced configurations
+# sqlalchemy==2.0.19         # Database ORM
+# alembic==1.11.1            # Database migrations

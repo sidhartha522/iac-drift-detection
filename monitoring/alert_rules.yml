@@ -1,0 +1,245 @@
+# Prometheus Alert Rules for IaC Drift Detection System
+groups:
+  - name: infrastructure_alerts
+    rules:
+      # System Resource Alerts
+      - alert: HighCpuUsage
+        expr: cpu_usage_percent > 85
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is above 85% for more than 2 minutes. Current value: {{ $value }}%"
+
+      - alert: HighMemoryUsage
+        expr: memory_usage_percent > 90
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is above 90% for more than 2 minutes. Current value: {{ $value }}%"
+
+      - alert: DiskSpaceLow
+        expr: disk_usage_percent > 95
+        for: 1m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Disk space critically low"
+          description: "Disk usage is above 95%. Current value: {{ $value }}%. Immediate action required."
+
+      - alert: DiskSpaceWarning
+        expr: disk_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "Disk space warning"
+          description: "Disk usage is above 80% for more than 5 minutes. Current value: {{ $value }}%"
+
+  - name: container_alerts
+    rules:
+      # Container Health Alerts
+      - alert: ContainerDown
+        expr: unhealthy_containers > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: containers
+        annotations:
+          summary: "Unhealthy containers detected"
+          description: "{{ $value }} containers are unhealthy. Check container logs and restart if necessary."
+
+      - alert: ContainerHighCpu
+        expr: rate(container_cpu_usage_seconds_total[5m]) * 100 > 80
+        for: 3m
+        labels:
+          severity: warning
+          component: containers
+        annotations:
+          summary: "High CPU usage in container"
+          description: "Container {{ $labels.name }} CPU usage is above 80% for more than 3 minutes."
+
+      - alert: ContainerHighMemory
+        expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) * 100 > 90
+        for: 2m
+        labels:
+          severity: warning
+          component: containers
+        annotations:
+          summary: "High memory usage in container"
+          description: "Container {{ $labels.name }} memory usage is above 90% of limit."
+
+  - name: drift_detection_alerts
+    rules:
+      # Drift Detection Alerts
+      - alert: InfrastructureDriftDetected
+        expr: drift_detected == 1
+        for: 0m
+        labels:
+          severity: warning
+          component: drift-detection
+        annotations:
+          summary: "Infrastructure drift detected"
+          description: "Drift has been detected in the infrastructure. Review changes and run remediation if necessary."
+
+      - alert: DriftMonitorDown
+        expr: up{job="drift-detection"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: drift-detection
+        annotations:
+          summary: "Drift detection monitor is down"
+          description: "The drift detection service has been down for more than 2 minutes."
+
+      - alert: RemediationFailed
+        expr: remediation_failed_total > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: remediation
+        annotations:
+          summary: "Infrastructure remediation failed"
+          description: "Automated remediation has failed {{ $value }} times. Manual intervention required."
+
+      - alert: LongRunningRemediation
+        expr: remediation_duration_minutes > 30
+        for: 0m
+        labels:
+          severity: warning
+          component: remediation
+        annotations:
+          summary: "Long running remediation"
+          description: "Remediation has been running for more than 30 minutes. Check remediation logs."
+
+  - name: infrastructure_health_alerts
+    rules:
+      # Infrastructure Health Alerts
+      - alert: InfrastructureHealthCritical
+        expr: infrastructure_health_score < 40
+        for: 1m
+        labels:
+          severity: critical
+          component: health
+        annotations:
+          summary: "Infrastructure health is critical"
+          description: "Overall infrastructure health score is {{ $value }}. Immediate attention required."
+
+      - alert: InfrastructureHealthWarning
+        expr: infrastructure_health_score < 70
+        for: 5m
+        labels:
+          severity: warning
+          component: health
+        annotations:
+          summary: "Infrastructure health degraded"
+          description: "Overall infrastructure health score is {{ $value }}. Investigation recommended."
+
+      - alert: NetworkConnectivityLost
+        expr: network_connectivity == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: network
+        annotations:
+          summary: "Network connectivity lost"
+          description: "Network connectivity check failed. Verify network configuration and Docker daemon status."
+
+  - name: backup_alerts
+    rules:
+      # Backup Alerts
+      - alert: BackupMissing
+        expr: time() - last_backup_timestamp > 86400
+        for: 0m
+        labels:
+          severity: warning
+          component: backup
+        annotations:
+          summary: "Backup overdue"
+          description: "No backup has been completed in the last 24 hours. Check backup system."
+
+      - alert: BackupFailed
+        expr: backup_failed_total > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: backup
+        annotations:
+          summary: "Backup failed"
+          description: "Backup operation failed. Check backup logs and storage availability."
+
+  - name: security_alerts
+    rules:
+      # Security Alerts
+      - alert: VulnerabilityDetected
+        expr: security_vulnerabilities_high > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: security
+        annotations:
+          summary: "High severity vulnerabilities detected"
+          description: "{{ $value }} high severity vulnerabilities found. Review and patch immediately."
+
+      - alert: ComplianceCheckFailed
+        expr: compliance_checks_failed > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "Compliance checks failed"
+          description: "{{ $value }} compliance checks failed. Review security configuration."
+
+  - name: performance_alerts
+    rules:
+      # Performance Alerts
+      - alert: DriftDetectionSlow
+        expr: drift_detection_duration_minutes > 10
+        for: 0m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "Drift detection taking too long"
+          description: "Drift detection took {{ $value }} minutes to complete. Consider optimizing checks."
+
+      - alert: TerraformPlanSlow
+        expr: terraform_plan_duration_minutes > 15
+        for: 0m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "Terraform plan execution slow"
+          description: "Terraform plan took {{ $value }} minutes to complete. Check resource complexity."
+
+  - name: operational_alerts
+    rules:
+      # Operational Alerts
+      - alert: LogVolumeHigh
+        expr: rate(log_messages_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: logging
+        annotations:
+          summary: "High log volume detected"
+          description: "Log message rate is {{ $value }} messages per second. Check for errors or debug logging."
+
+      - alert: ApiEndpointDown
+        expr: up{job="drift-detection"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "API endpoint is down"
+          description: "The drift detection API has been unreachable for more than 2 minutes."
